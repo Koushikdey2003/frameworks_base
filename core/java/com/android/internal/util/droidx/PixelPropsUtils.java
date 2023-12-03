@@ -24,11 +24,14 @@ import android.app.Application;
 import android.app.TaskStackListener;
 import android.content.ComponentName;
 import android.content.Context;
+import android.content.pm.PackageManager;
 import android.os.Binder;
 import android.os.Build;
 import android.os.Process;
 import android.os.SystemProperties;
 import android.util.Log;
+
+import com.android.internal.util.droidx.DroidXUtils;
 
 import java.lang.reflect.Field;
 import java.util.ArrayList;
@@ -36,6 +39,9 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.regex.Pattern;
+import java.util.regex.Matcher;
+import java.util.Random;
 
 public class PixelPropsUtils {
 
@@ -47,6 +53,9 @@ public class PixelPropsUtils {
             "com.google.android.gms/.auth.uiflows.minutemaid.MinuteMaidActivity");
 
     private static final boolean DEBUG = false;
+
+    private static final Boolean sEnablePixelProps =
+            Resources.getSystem().getBoolean(R.bool.config_enablePixelProps);
 
     private static final Map<String, Object> propsToChangeGeneric;
     private static final Map<String, Object> propsToChangePixel7Pro;
@@ -94,22 +103,6 @@ public class PixelPropsUtils {
             "com.google.android.apps.cameralite"
     };
 
-    // Codenames for currently supported Pixels by Google
-    private static final String[] pixelCodenames = {
-            "felix",
-            "tangorpro",
-            "lynx",
-            "cheetah",
-            "panther",
-            "bluejay",
-            "oriole",
-            "raven",
-            "barbet",
-            "redfin",
-            "bramble",
-            "sunfish"
-    };
-    
     private static final Map<String, Object> propsToChangeROG1;
     private static final String[] packagesToChangeROG1 = {
             "com.dts.freefireth",
@@ -141,6 +134,7 @@ public class PixelPropsUtils {
     };
 
     private static volatile boolean sIsGms, sIsFinsky, sIsPhotos;
+    private static volatile String sProcessName;
 
     static {
         propsToKeep = new HashMap<>();
@@ -179,64 +173,101 @@ public class PixelPropsUtils {
         propsToChangeOP8P.put("MANUFACTURER", "OnePlus");
     }
 
+    private static String getBuildID(String fingerprint) {
+        Pattern pattern = Pattern.compile("([A-Za-z0-9]+\\.\\d+\\.\\d+\\.\\w+)");
+        Matcher matcher = pattern.matcher(fingerprint);
+
+        if (matcher.find()) {
+            return matcher.group(1);
+        }
+        return "";
+    }
+
+    private static String getDeviceName(String fingerprint) {
+        String[] parts = fingerprint.split("/");
+        if (parts.length >= 2) {
+            return parts[1];
+        }
+        return "";
+    }
+
     private static boolean isGoogleCameraPackage(String packageName) {
         return packageName.startsWith("com.google.android.GoogleCamera") ||
                 Arrays.asList(customGoogleCameraPackages).contains(packageName);
     }
-    
-    public static boolean setPropsForGms(String packageName) {
-        if (packageName.equals("com.android.vending")) {
-            sIsFinsky = true;
-        }
-        if (packageName.equals(PACKAGE_GMS)
-                || packageName.toLowerCase().contains("androidx.test")
-                || packageName.equalsIgnoreCase("com.google.android.apps.restore")) {
-            setPropValue("TIME", System.currentTimeMillis());
-            final String processName = Application.getProcessName();
-            if (processName.toLowerCase().contains("unstable")
-                    || processName.toLowerCase().contains("pixelmigrate")
-                    || processName.toLowerCase().contains("instrumentation")) {
-                sIsGms = true;
 
-                final boolean was = isGmsAddAccountActivityOnTop();
-                final TaskStackListener taskStackListener = new TaskStackListener() {
-                    @Override
-                    public void onTaskStackChanged() {
-                        final boolean is = isGmsAddAccountActivityOnTop();
-                        if (is ^ was) {
-                            dlog("GmsAddAccountActivityOnTop is:" + is + " was:" + was + ", killing myself!");
-                            // process will restart automatically later
-                            Process.killProcess(Process.myPid());
-                        }
-                    }
-                };
-                try {
-                    ActivityTaskManager.getService().registerTaskStackListener(taskStackListener);
-                } catch (Exception e) {
-                    Log.e(TAG, "Failed to register task stack listener!", e);
+    private static boolean shouldTryToCertifyDevice() {
+        final boolean was = isGmsAddAccountActivityOnTop();
+        final String reason = "GmsAddAccountActivityOnTop";
+        if (!was) {
+            return true;
+        }
+        dlog("Skip spoofing build for GMS, because " + reason + "!");
+        TaskStackListener taskStackListener = new TaskStackListener() {
+            @Override
+            public void onTaskStackChanged() {
+                final boolean isNow = isGmsAddAccountActivityOnTop();
+                if (isNow ^ was) {
+                    dlog(String.format("%s changed: isNow=%b, was=%b, killing myself!", reason, isNow, was));
+                    Process.killProcess(Process.myPid());
                 }
-                if (was) return true;
-
-                dlog("Spoofing build for GMS");
-                // Alter model name and fingerprint to Redmi Go to avoid hardware attestation enforcement
-                // Alter build parameters to Nexus 6P for avoiding hardware attestation enforcement
-                setPropValue("DEVICE", "bullhead");
-                setPropValue("FINGERPRINT", "google/bullhead/bullhead:8.0.0/OPR6.170623.013/4283548:user/release-keys");
-                setPropValue("MODEL", "Nexus 5X");
-                setPropValue("PRODUCT", "bullhead");
-                setVersionField("DEVICE_INITIAL_SDK_INT", Build.VERSION_CODES.N);
-                return true;
             }
+        };
+        try {
+            ActivityTaskManager.getService().registerTaskStackListener(taskStackListener);
+            return false;
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to register task stack listener!", e);
+            return true;
         }
-        return false;
+    }
+
+    public static void spoofBuildGms(Context context) {
+        String packageName = "org.evolution.pif";
+
+        if (!DroidXUtils.isPackageInstalled(context, packageName)) {
+            Log.e(TAG, "'" + packageName + "' is not installed.");
+            return;
+        }
+
+        PackageManager pm = context.getPackageManager();
+
+        try {
+            Resources resources = pm.getResourcesForApplication(packageName);
+
+            int resourceId = resources.getIdentifier("device_arrays", "array", packageName);
+            if (resourceId != 0) {
+                String[] deviceArrays = resources.getStringArray(resourceId);
+
+                if (deviceArrays.length > 0) {
+                    int randomIndex = new Random().nextInt(deviceArrays.length);
+                    int selectedArrayResId = resources.getIdentifier(deviceArrays[randomIndex], "array", packageName);
+                    String[] selectedDeviceProps = resources.getStringArray(selectedArrayResId);
+
+                    setPropValue("BRAND", selectedDeviceProps[0]);
+                    setPropValue("MANUFACTURER", selectedDeviceProps[1]);
+                    setPropValue("ID", selectedDeviceProps[2].isEmpty() ? getBuildID(selectedDeviceProps[6]) : selectedDeviceProps[2]);
+                    setPropValue("DEVICE", selectedDeviceProps[3].isEmpty() ? getDeviceName(selectedDeviceProps[6]) : selectedDeviceProps[3]);
+                    setPropValue("PRODUCT", selectedDeviceProps[4].isEmpty() ? getDeviceName(selectedDeviceProps[6]) : selectedDeviceProps[4]);
+                    setPropValue("MODEL", selectedDeviceProps[5]);
+                    setPropValue("FINGERPRINT", selectedDeviceProps[6]);
+                    setPropValue("TYPE", selectedDeviceProps[7].isEmpty() ? "user" : selectedDeviceProps[7]);
+                    setPropValue("TAGS", selectedDeviceProps[8].isEmpty() ? "release-keys" : selectedDeviceProps[8]);
+                } else {
+                    Log.e(TAG, "No device arrays found.");
+                }
+            } else {
+                Log.e(TAG, "Resource 'device_arrays' not found.");
+            }
+
+        } catch (PackageManager.NameNotFoundException e) {
+            Log.e(TAG, "Error getting resources for '" + packageName + "': " + e.getMessage());
+        }
     }
 
     public static void setProps(String packageName) {
         propsToChangeGeneric.forEach((k, v) -> setPropValue(k, v));
-        if (packageName == null || packageName.isEmpty()) {
-            return;
-        }
-        if (setPropsForGms(packageName)){
+        if (packageName == null || processName == null || packageName.isEmpty()) {
             return;
         }
         if (Arrays.asList(packagesToKeep).contains(packageName)) {
@@ -247,13 +278,25 @@ public class PixelPropsUtils {
         }
 
         Map<String, Object> propsToChange = new HashMap<>();
+        sProcessName = processName;
+        sIsGms = packageName.equals(PACKAGE_GMS) && processName.equals(PROCESS_GMS_UNSTABLE);
+        sIsFinsky = packageName.equals(PACKAGE_FINSKY);
 
-        if (packageName.startsWith("com.google.")
+        if (sIsGms) {
+            if (shouldTryToCertifyDevice()) {
+                dlog("Spoofing build for GMS");
+                spoofBuildGms(context);
+            }
+        } else if (packageName.equals(PACKAGE_GMS)) {
+            setPropValue("TIME", System.currentTimeMillis());
+        } else if (packageName.startsWith("com.google.")
                 || packageName.startsWith("com.samsung.")
                 || Arrays.asList(extraPackagesToChange).contains(packageName)) {
 
-            boolean isPixelDevice = Arrays.asList(pixelCodenames).contains(SystemProperties.get(DEVICE));
-
+            if (!sEnablePixelProps) {
+                dlog("Pixel props is disabled by config");
+                return;
+            }
             if (packageName.equals("com.google.android.apps.photos")) {
                 propsToChange.putAll(propsToChangePixelXL);
             } else if (isPixelDevice) {
@@ -370,20 +413,20 @@ public class PixelPropsUtils {
     }
 
     private static boolean isCallerSafetyNet() {
-        return sIsGms && Arrays.stream(Thread.currentThread().getStackTrace())
+        return shouldTryToCertifyDevice() && sIsGms && Arrays.stream(Thread.currentThread().getStackTrace())
                 .anyMatch(elem -> elem.getClassName().contains("DroidGuard"));
     }
 
     public static void onEngineGetCertificateChain() {
         // Check stack for SafetyNet or Play Integrity
         if (isCallerSafetyNet() || sIsFinsky) {
-            Log.i(TAG, "Blocked key attestation sIsGms=" + sIsGms + " sIsFinsky=" + sIsFinsky);
+            dlog("Blocked key attestation sIsGms=" + sIsGms + " sIsFinsky=" + sIsFinsky);
             throw new UnsupportedOperationException();
         }
     }
 
     public static void dlog(String msg) {
-        if (DEBUG) Log.d(TAG, msg);
+        if (DEBUG) Log.d(TAG, "[" + sProcessName + "] " + msg);
     }
 
 }
